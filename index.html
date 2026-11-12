@@ -182,11 +182,13 @@ populateDevices();
 // Distortion geometry
 //--------------------------------------------------
 
+const insetX = canvas.width * 0.05;
+const insetY = canvas.height * 0.05;
 const corners = [
-    {x:Math.min(200, canvas.width * 0.2), y:canvas.height > 700 ? 150 : canvas.height * 0.2},
-    {x:canvas.width > 900 ? 900 : canvas.width * 0.8, y:canvas.height > 700 ? 150 : canvas.height * 0.2},
-    {x:canvas.width > 900 ? 900 : canvas.width * 0.8, y:canvas.height > 700 ? 700 : canvas.height * 0.8},
-    {x:Math.min(200, canvas.width * 0.2), y:canvas.height > 700 ? 700 : canvas.height * 0.8}
+    {x:insetX, y:insetY},
+    {x:canvas.width-insetX, y:insetY},
+    {x:canvas.width-insetX, y:canvas.height-insetY},
+    {x:insetX, y:canvas.height-insetY}
 ];
 
 let dragging = -1;
