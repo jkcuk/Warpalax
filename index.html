@@ -39,6 +39,7 @@ body {
     display: block;
     width: 100vw;
     height: 100vh;
+    height: 100dvh;
     pointer-events: auto;
 }
 
@@ -116,15 +117,17 @@ let shaderUniforms = null;
 let quadBuffer = null;
 
 function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-    glCanvas.width = window.innerWidth;
-    glCanvas.height = window.innerHeight;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.round(rect.width);
+    canvas.height = Math.round(rect.height);
+    glCanvas.width = canvas.width;
+    glCanvas.height = canvas.height;
     if (gl) {
         gl.viewport(0, 0, glCanvas.width, glCanvas.height);
     }
 }
 window.addEventListener('resize', resize);
+window.visualViewport?.addEventListener('resize', resize);
 resize();
 
 let stream = null;
