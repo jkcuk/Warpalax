@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Warpalax</title>
+
+<style>
+body {
+    margin: 0;
+    background: #222;
+    color: white;
+    font-family: sans-serif;
+    overflow: hidden;
+}
+
+#controls {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 100;
+    background: rgba(0,0,0,0.7);
+    padding: 10px;
+    border-radius: 8px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+#canvas, #glCanvas {
+    position: fixed;
+    inset: 0;
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    pointer-events: auto;
+}
+
+#glCanvas {
+    z-index: 0;
+}
+
+#canvas {
+    z-index: 1;
+}
+
+label {
+    font-size: 16px;
+}
+
+select {
+    font-size: 16px;
+}
+
+</style>
+</head>
+<body>
+
+<div id="controls">
+    <label>Camera:</label>
+    <select id="cameraSelect"></select>
+    <label>Method:</label>
+    <select id="methodSelect">
+        <!-- <option value="mesh">Way 1: Canvas mesh</option> -->
+        <option value="bilinear">Bilinear warp</option>
+        <option value="homography">Homography warp</option>
+    </select>
+</div>
+
+<video id="video" autoplay playsinline muted style="display:none"></video>
+<canvas id="glCanvas"></canvas>
+<canvas id="canvas"></canvas>
+
+<script>
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const glCanvas = document.getElementById('glCanvas');
+const video = document.getElementById('video');
+const cameraSelect = document.getElementById('cameraSelect');
+const methodSelect = document.getElementById('methodSelect');
+
+const gl = glCanvas.getContext('webgl', {preserveDrawingBuffer: false});
+let distortionMode = methodSelect.value;
+let shaderProgram = null;
+let shaderUniforms = null;
+let quadBuffer = null;
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    glCanvas.width = window.innerWidth;
+    glCanvas.height = window.innerHeight;
+    if (gl) {
+        gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    }
+}
+window.addEventListener('resize', resize);
+resize();
+
+let stream = null;
+
+async function populateDevices() {
+
+    await navigator.mediaDevices.getUserMedia({video:true});
+
+    const devices =
+        (await navigator.mediaDevices.enumerateDevices())
+        .filter(d => d.kind === 'videoinput');
+
+    cameraSelect.innerHTML = '';
+
+    devices.forEach((device, i) => {
+
+        const option = document.createElement('option');
+        option.value = device.deviceId;
+        option.textContent =
+            device.label || `Camera ${i+1}`;
+
+        cameraSelect.appendChild(option);
+    });
+
+    if (devices.length)
+        startCamera(devices[0].deviceId);
+}
+
+async function startCamera(deviceId) {
+
+    if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+            deviceId: { exact: deviceId }
+        }
+    });
+
+    video.srcObject = stream;
+}
+
+cameraSelect.addEventListener('change', () => {
+    startCamera(cameraSelect.value);
+});
+methodSelect.addEventListener('change', () => {
+    distortionMode = methodSelect.value;
+});
+
+populateDevices();
+
+
+//--------------------------------------------------
+// Distortion geometry
+//--------------------------------------------------
+
+const corners = [
+    {x:200,y:150},
+    {x:900,y:150},
+    {x:900,y:700},
+    {x:200,y:700}
+];
+
+let dragging = -1;
+
+function handleDown(e){
+
+    const mx = e.clientX;
+    const my = e.clientY;
+
+    for(let i=0;i<4;i++){
+
+        const dx = mx-corners[i].x;
+        const dy = my-corners[i].y;
+
+        if(dx*dx+dy*dy<15*15){
+            dragging=i;
+            return;
+        }
+    }
+}
+
+function handleMove(e){
+
+    if(dragging<0) return;
+
+    corners[dragging].x=e.clientX;
+    corners[dragging].y=e.clientY;
+}
+
+function handleUp(){
+    dragging=-1;
+}
+
+canvas.addEventListener('mousedown',handleDown);
+window.addEventListener('mousemove',handleMove);
+window.addEventListener('mouseup',handleUp);
+
+
+//--------------------------------------------------
+// Bilinear interpolation
+//--------------------------------------------------
+
+function bilinear(u,v){
+
+    const p0=corners[0];
+    const p1=corners[1];
+    const p2=corners[2];
+    const p3=corners[3];
+
+    const x=
+        (1-u)*(1-v)*p0.x +
+        u*(1-v)*p1.x +
+        u*v*p2.x +
+        (1-u)*v*p3.x;
+
+    const y=
+        (1-u)*(1-v)*p0.y +
+        u*(1-v)*p1.y +
+        u*v*p2.y +
+        (1-u)*v*p3.y;
+
+    return {x,y};
+}
+
+// Homography calculation
+//
+
+function solveLinearSystem(A, b) {
+
+    const n = b.length;
+
+    for (let i = 0; i < n; i++) {
+
+        let pivot = i;
+
+        for (let j = i + 1; j < n; j++) {
+            if (Math.abs(A[j][i]) > Math.abs(A[pivot][i]))
+                pivot = j;
+        }
+
+        [A[i], A[pivot]] = [A[pivot], A[i]];
+        [b[i], b[pivot]] = [b[pivot], b[i]];
+
+        const div = A[i][i];
+        if (Math.abs(div) < 1e-12) {
+            return null;
+        }
+
+        for (let k = i; k < n; k++)
+            A[i][k] /= div;
+
+        b[i] /= div;
+
+        for (let j = 0; j < n; j++) {
+
+            if (j === i) continue;
+
+            const factor = A[j][i];
+
+            for (let k = i; k < n; k++)
+                A[j][k] -= factor * A[i][k];
+
+            b[j] -= factor * b[i];
+        }
+    }
+
+    return b;
+}
+
+function computeHomography(corners)
+{
+    const src = [
+        [0,0],
+        [1,0],
+        [1,1],
+        [0,1]
+    ];
+
+    const dst = corners.map(p => [
+        p.x / glCanvas.width,
+        p.y / glCanvas.height
+    ]);
+
+    const A = [];
+    const b = [];
+
+    for(let i=0;i<4;i++)
+    {
+        const u = src[i][0];
+        const v = src[i][1];
+
+        const x = dst[i][0];
+        const y = dst[i][1];
+
+        A.push([
+            u,v,1,0,0,0,
+            -u*x,-v*x
+        ]);
+
+        b.push(x);
+
+        A.push([
+            0,0,0,u,v,1,
+            -u*y,-v*y
+        ]);
+
+        b.push(y);
+    }
+
+    const h = solveLinearSystem(A,b);
+    if (!h) return null;
+
+    return [
+        h[0],h[1],h[2],
+        h[3],h[4],h[5],
+        h[6],h[7],1
+    ];
+}
+
+function invert3x3(m)
+{
+    const
+    a=m[0], b=m[1], c=m[2],
+    d=m[3], e=m[4], f=m[5],
+    g=m[6], h=m[7], i=m[8];
+
+    const det =
+        a*(e*i-f*h)
+      - b*(d*i-f*g)
+      + c*(d*h-e*g);
+
+    if (Math.abs(det) < 1e-12) {
+        return null;
+    }
+
+    return [
+
+        (e*i-f*h)/det,
+        (c*h-b*i)/det,
+        (b*f-c*e)/det,
+
+        (f*g-d*i)/det,
+        (a*i-c*g)/det,
+        (c*d-a*f)/det,
+
+        (d*h-e*g)/det,
+        (b*g-a*h)/det,
+        (a*e-b*d)/det
+    ];
+}
+
+function ensureQuadBuffer()
+{
+    if (quadBuffer) return;
+
+    quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([
+            -1, -1,
+             1, -1,
+            -1,  1,
+             1,  1
+        ]),
+        gl.STATIC_DRAW
+    );
+}
+
+let videoTexture = null;
+
+function updateVideoTexture()
+{
+    gl.activeTexture(gl.TEXTURE0);
+
+    if (!videoTexture) {
+        videoTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    } else {
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    }
+
+    gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        video
+    );
+}
+
+homeographyVertexShaderSource = `
+attribute vec2 aPosition;
+
+varying vec2 vScreen;
+
+void main()
+{
+    vScreen = aPosition*0.5 + 0.5;
+
+    gl_Position = vec4(aPosition,0.0,1.0);
+}`
+
+homeographyFragmentShaderSource = `
+precision highp float;
+
+varying vec2 vScreen;
+
+uniform sampler2D uVideo;
+
+uniform mat3 uHinv;
+
+void main()
+{
+    vec2 screenPoint = vec2(vScreen.x, 1.0 - vScreen.y);
+    vec3 q = uHinv * vec3(screenPoint,1.0);
+
+    vec2 uv = q.xy / q.z;
+
+    if(
+        uv.x < 0.0 ||
+        uv.x > 1.0 ||
+        uv.y < 0.0 ||
+        uv.y > 1.0
+    ){
+        discard;
+    }
+
+    gl_FragColor =
+        texture2D(
+            uVideo,
+            vec2(uv.x,1.0-uv.y)
+        );
+}`;
+
+let homographyProgram = null;
+let homographyUniforms = null;
+
+function createHomographyProgram()
+{
+    if (!gl || homographyProgram) return;
+
+    const vertexShader =
+        gl.createShader(gl.VERTEX_SHADER);
+
+    gl.shaderSource(
+        vertexShader,
+        homeographyVertexShaderSource
+    );
+
+    gl.compileShader(vertexShader);
+
+    const fragmentShader =
+        gl.createShader(gl.FRAGMENT_SHADER);
+
+    gl.shaderSource(
+        fragmentShader,
+        homeographyFragmentShaderSource
+    );
+
+    gl.compileShader(fragmentShader);
+
+    homographyProgram =
+        gl.createProgram();
+
+    gl.attachShader(
+        homographyProgram,
+        vertexShader
+    );
+
+    gl.attachShader(
+        homographyProgram,
+        fragmentShader
+    );
+
+    gl.linkProgram(
+        homographyProgram
+    );
+
+    if(
+        !gl.getProgramParameter(
+            homographyProgram,
+            gl.LINK_STATUS
+        )
+    ){
+        console.error(
+            gl.getProgramInfoLog(
+                homographyProgram
+            )
+        );
+        homographyProgram = null;
+        return;
+    }
+
+    homographyUniforms = {
+
+        position:
+            gl.getAttribLocation(
+                homographyProgram,
+                "aPosition"
+            ),
+
+        video:
+            gl.getUniformLocation(
+                homographyProgram,
+                "uVideo"
+            ),
+
+        Hinv:
+            gl.getUniformLocation(
+                homographyProgram,
+                "uHinv"
+            )
+    };
+}
+
+function drawHomographyWarp()
+{
+    if (!gl || video.readyState < 2) return;
+
+    createHomographyProgram();
+    if (!homographyProgram) return;
+
+    ensureQuadBuffer();
+    updateVideoTexture();
+
+    gl.bindBuffer(
+        gl.ARRAY_BUFFER,
+        quadBuffer
+    );
+
+    gl.enableVertexAttribArray(
+        homographyUniforms.position
+    );
+
+    gl.vertexAttribPointer(
+        homographyUniforms.position,
+        2,
+        gl.FLOAT,
+        false,
+        0,
+        0
+    );
+
+    gl.useProgram(homographyProgram);
+    gl.uniform1i(homographyUniforms.video, 0);
+
+    const H = computeHomography(corners);
+    if (!H) return;
+
+    const Hinv =
+        invert3x3(H);
+    if (!Hinv) return;
+
+    gl.uniformMatrix3fv(
+        homographyUniforms.Hinv,
+        false,
+        new Float32Array([
+            Hinv[0], Hinv[3], Hinv[6],
+            Hinv[1], Hinv[4], Hinv[7],
+            Hinv[2], Hinv[5], Hinv[8]
+        ])
+    );
+
+    gl.drawArrays(
+        gl.TRIANGLE_STRIP,
+        0,
+        4
+    );
+}
+
+//--------------------------------------------------
+// Triangle texture mapping
+//--------------------------------------------------
+
+function drawTriangle(
+    img,
+    sx0,sy0,sx1,sy1,sx2,sy2,
+    dx0,dy0,dx1,dy1,dx2,dy2
+){
+
+    ctx.save();
+
+    ctx.beginPath();
+    ctx.moveTo(dx0,dy0);
+    ctx.lineTo(dx1,dy1);
+    ctx.lineTo(dx2,dy2);
+    ctx.closePath();
+    ctx.clip();
+
+    const delta =
+        sx0*(sy1-sy2) +
+        sx1*(sy2-sy0) +
+        sx2*(sy0-sy1);
+
+    if(Math.abs(delta)<1e-6){
+        ctx.restore();
+        return;
+    }
+
+    const m11 =
+        (dx0*(sy1-sy2) +
+         dx1*(sy2-sy0) +
+         dx2*(sy0-sy1))/delta;
+
+    const m12 =
+        (dy0*(sy1-sy2) +
+         dy1*(sy2-sy0) +
+         dy2*(sy0-sy1))/delta;
+
+    const m21 =
+        (dx0*(sx2-sx1) +
+         dx1*(sx0-sx2) +
+         dx2*(sx1-sx0))/delta;
+
+    const m22 =
+        (dy0*(sx2-sx1) +
+         dy1*(sx0-sx2) +
+         dy2*(sx1-sx0))/delta;
+
+    const dx =
+        (dx0*(sx1*sy2-sx2*sy1) +
+         dx1*(sx2*sy0-sx0*sy2) +
+         dx2*(sx0*sy1-sx1*sy0))/delta;
+
+    const dy =
+        (dy0*(sx1*sy2-sx2*sy1) +
+         dy1*(sx2*sy0-sx0*sy2) +
+         dy2*(sx0*sy1-sx1*sy0))/delta;
+
+    ctx.setTransform(m11,m12,m21,m22,dx,dy);
+
+    ctx.drawImage(img,0,0);
+
+    ctx.restore();
+}
+
+
+//--------------------------------------------------
+// Mesh warp
+//--------------------------------------------------
+
+const meshSize = 20;
+
+function drawWarpedVideo() {
+
+    if(video.readyState < 2) return;
+
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+
+    for(let iy=0; iy<meshSize; iy++) {
+
+        const v0 = iy/meshSize;
+        const v1 = (iy+1)/meshSize;
+
+        for(let ix=0; ix<meshSize; ix++) {
+
+            const u0 = ix/meshSize;
+            const u1 = (ix+1)/meshSize;
+
+            const p00 = bilinear(u0,v0);
+            const p10 = bilinear(u1,v0);
+            const p11 = bilinear(u1,v1);
+            const p01 = bilinear(u0,v1);
+
+            const sx0=u0*w;
+            const sx1=u1*w;
+
+            const sy0=v0*h;
+            const sy1=v1*h;
+
+            drawTriangle(
+                video,
+                sx0,sy0,
+                sx1,sy0,
+                sx1,sy1,
+
+                p00.x,p00.y,
+                p10.x,p10.y,
+                p11.x,p11.y
+            );
+
+            drawTriangle(
+                video,
+                sx0,sy0,
+                sx1,sy1,
+                sx0,sy1,
+
+                p00.x,p00.y,
+                p11.x,p11.y,
+                p01.x,p01.y
+            );
+        }
+    }
+}
+
+
+//--------------------------------------------------
+// Shader warp
+//--------------------------------------------------
+
+function createShaderProgram() {
+    if (!gl || shaderProgram) return;
+
+    const vertexSource = `
+        attribute vec2 aPosition;
+        varying vec2 vScreen;
+
+        void main() {
+            vScreen = aPosition * 0.5 + 0.5;
+            gl_Position = vec4(aPosition, 0.0, 1.0);
+        }
+    `;
+
+    const fragmentSource = `
+        precision highp float;
+
+        varying vec2 vScreen;
+        uniform sampler2D uVideo;
+        uniform vec2 uCorner0;
+        uniform vec2 uCorner1;
+        uniform vec2 uCorner2;
+        uniform vec2 uCorner3;
+
+        bool inside(vec2 p, vec2 a, vec2 b) {
+            return (b.x-a.x)*(p.y-a.y)
+                - (b.y-a.y)*(p.x-a.x) >= 0.0;
+        }
+
+        void main() {
+            // Canvas pointer and corner coordinates use a top-left origin;
+            // WebGL fragment coordinates use a bottom-left origin.
+            vec2 p = vec2(vScreen.x, 1.0 - vScreen.y);
+            vec2 uv = vec2(0.5, 0.5);
+            vec2 p00 = uCorner0;
+            vec2 p10 = uCorner1;
+            vec2 p11 = uCorner2;
+            vec2 p01 = uCorner3;
+
+            vec2 a = p00;
+            vec2 b = p10 - p00;
+            vec2 c = p01 - p00;
+            vec2 d = p11 - p10 - p01 + p00;
+
+            bool ok =
+                inside(p,p00,p10) &&
+                inside(p,p10,p11) &&
+                inside(p,p11,p01) &&
+                inside(p,p01,p00);
+
+            if(!ok){
+                discard;
+            }
+
+            for (int i = 0; i < 32; i++) {
+                vec2 f = a + b * uv.x + c * uv.y + d * uv.x * uv.y - p;
+
+                vec2 dfdu = b + d * uv.y;
+                vec2 dfdv = c + d * uv.x;
+                float det = dfdu.x * dfdv.y - dfdu.y * dfdv.x;
+
+                if (abs(det) < 1e-6) {
+                    break;
+                }
+
+                float du = (f.x * dfdv.y - f.y * dfdv.x) / det;
+                float dv = (dfdu.x * f.y - dfdu.y * f.x) / det;
+
+                uv.x -= du;
+                uv.y -= dv;
+
+                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+                    uv = clamp(uv, vec2(0.0), vec2(1.0));
+                }
+
+                if (length(f) < 1e-5) {
+                    break;
+                }
+            }
+
+            vec2 texCoord = vec2(uv.x, 1.0 - uv.y);
+            gl_FragColor = texture2D(uVideo, texCoord);
+        }
+    `;
+
+    const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vertexShader, vertexSource);
+    gl.compileShader(vertexShader);
+
+    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fragmentShader, fragmentSource);
+    gl.compileShader(fragmentShader);
+
+    shaderProgram = gl.createProgram();
+    gl.attachShader(shaderProgram, vertexShader);
+    gl.attachShader(shaderProgram, fragmentShader);
+    gl.linkProgram(shaderProgram);
+
+    if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+        console.error(gl.getProgramInfoLog(shaderProgram));
+        shaderProgram = null;
+        return;
+    }
+
+    ensureQuadBuffer();
+
+    shaderUniforms = {
+        position: gl.getAttribLocation(shaderProgram, 'aPosition'),
+        video: gl.getUniformLocation(shaderProgram, 'uVideo'),
+        corner0: gl.getUniformLocation(shaderProgram, 'uCorner0'),
+        corner1: gl.getUniformLocation(shaderProgram, 'uCorner1'),
+        corner2: gl.getUniformLocation(shaderProgram, 'uCorner2'),
+        corner3: gl.getUniformLocation(shaderProgram, 'uCorner3')
+    };
+}
+
+function drawShaderWarp() {
+    if (!gl || !video || video.readyState < 2) return;
+
+    createShaderProgram();
+    if (!shaderProgram) return;
+
+    ensureQuadBuffer();
+    updateVideoTexture();
+
+    gl.useProgram(shaderProgram);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.enableVertexAttribArray(shaderUniforms.position);
+    gl.vertexAttribPointer(shaderUniforms.position, 2, gl.FLOAT, false, 0, 0);
+
+    gl.uniform1i(shaderUniforms.video, 0);
+
+    gl.uniform2f(shaderUniforms.corner0, corners[0].x / glCanvas.width, corners[0].y / glCanvas.height);
+    gl.uniform2f(shaderUniforms.corner1, corners[1].x / glCanvas.width, corners[1].y / glCanvas.height);
+    gl.uniform2f(shaderUniforms.corner2, corners[2].x / glCanvas.width, corners[2].y / glCanvas.height);
+    gl.uniform2f(shaderUniforms.corner3, corners[3].x / glCanvas.width, corners[3].y / glCanvas.height);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+
+//--------------------------------------------------
+// Rendering
+//--------------------------------------------------
+
+function drawHandles(){
+
+    ctx.strokeStyle='cyan';
+    ctx.lineWidth=2;
+
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x,corners[0].y);
+    ctx.lineTo(corners[1].x,corners[1].y);
+    ctx.lineTo(corners[2].x,corners[2].y);
+    ctx.lineTo(corners[3].x,corners[3].y);
+    ctx.closePath();
+    ctx.stroke();
+
+    for(const p of corners){
+
+        ctx.fillStyle='red';
+        ctx.beginPath();
+        ctx.arc(p.x,p.y,8,0,Math.PI*2);
+        ctx.fill();
+    }
+}
+
+function animate(){
+
+    requestAnimationFrame(animate);
+
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    if(distortionMode==="homography")
+    {
+        if (gl) {
+            gl.clearColor(0,0,0,0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+        drawHomographyWarp();
+    }
+    else if (distortionMode === 'bilinear') {
+        if (gl) {
+            gl.clearColor(0,0,0,1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            drawShaderWarp();
+        }
+    } else {
+        drawWarpedVideo();
+    }
+
+    drawHandles();
+}
+
+animate();
+
+</script>
+</body>
+</html>
