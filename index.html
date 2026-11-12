@@ -2,9 +2,14 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Warpalax</title>
 
 <style>
+* {
+    box-sizing: border-box;
+}
+
 body {
     margin: 0;
     background: #222;
@@ -15,16 +20,17 @@ body {
 
 #controls {
     position: absolute;
-    top: 10px;
-    left: 10px;
+    top: calc(10px + env(safe-area-inset-top));
+    left: calc(10px + env(safe-area-inset-left));
     z-index: 100;
     background: rgba(0,0,0,0.7);
     padding: 10px;
     border-radius: 8px;
     display: flex;
-    gap: 12px;
+    gap: 8px 12px;
     align-items: center;
     flex-wrap: wrap;
+    max-width: calc(100vw - 20px - env(safe-area-inset-left) - env(safe-area-inset-right));
 }
 
 #canvas, #glCanvas {
@@ -50,6 +56,29 @@ label {
 
 select {
     font-size: 16px;
+    min-height: 44px;
+    max-width: 100%;
+}
+
+#canvas {
+    touch-action: none;
+}
+
+@media (max-width: 600px) {
+    #controls {
+        right: calc(10px + env(safe-area-inset-right));
+        gap: 8px;
+    }
+
+    #cameraSelect {
+        flex: 1 1 55%;
+        min-width: 0;
+    }
+
+    #methodSelect {
+        flex: 1 1 45%;
+        min-width: 0;
+    }
 }
 
 </style>
@@ -154,46 +183,99 @@ populateDevices();
 //--------------------------------------------------
 
 const corners = [
-    {x:200,y:150},
-    {x:900,y:150},
-    {x:900,y:700},
-    {x:200,y:700}
+    {x:Math.min(200, canvas.width * 0.2), y:canvas.height > 700 ? 150 : canvas.height * 0.2},
+    {x:canvas.width > 900 ? 900 : canvas.width * 0.8, y:canvas.height > 700 ? 150 : canvas.height * 0.2},
+    {x:canvas.width > 900 ? 900 : canvas.width * 0.8, y:canvas.height > 700 ? 700 : canvas.height * 0.8},
+    {x:Math.min(200, canvas.width * 0.2), y:canvas.height > 700 ? 700 : canvas.height * 0.8}
 ];
 
 let dragging = -1;
+let draggingPointerId = null;
 
-function handleDown(e){
+function startDragging(clientX, clientY, inputId){
+    if(draggingPointerId !== null) return;
 
-    const mx = e.clientX;
-    const my = e.clientY;
+    const rect = canvas.getBoundingClientRect();
+    const mx = (clientX - rect.left) * canvas.width / rect.width;
+    const my = (clientY - rect.top) * canvas.height / rect.height;
+    const hitRadius = 30 * canvas.width / rect.width;
+    let nearestDistance = hitRadius * hitRadius;
 
     for(let i=0;i<4;i++){
-
         const dx = mx-corners[i].x;
         const dy = my-corners[i].y;
+        const distance = dx*dx+dy*dy;
 
-        if(dx*dx+dy*dy<15*15){
+        if(distance <= nearestDistance){
             dragging=i;
+            draggingPointerId = inputId;
+            nearestDistance = distance;
+        }
+    }
+}
+
+function moveDragging(clientX, clientY, inputId){
+    if(dragging<0 || inputId !== draggingPointerId) return;
+
+    const rect = canvas.getBoundingClientRect();
+    corners[dragging].x=(clientX - rect.left) * canvas.width / rect.width;
+    corners[dragging].y=(clientY - rect.top) * canvas.height / rect.height;
+}
+
+function stopDragging(inputId){
+    if(inputId !== draggingPointerId) return;
+    dragging=-1;
+    draggingPointerId=null;
+}
+
+function handlePointerDown(e){
+    startDragging(e.clientX, e.clientY, e.pointerId);
+    if(dragging >= 0){
+        e.preventDefault();
+        canvas.setPointerCapture(e.pointerId);
+    }
+}
+
+function handlePointerMove(e){
+    moveDragging(e.clientX, e.clientY, e.pointerId);
+}
+
+function handleTouchStart(e){
+    if(draggingPointerId !== null) return;
+    const touch = e.changedTouches[0];
+    if(!touch) return;
+    startDragging(touch.clientX, touch.clientY, touch.identifier);
+    if(dragging >= 0) e.preventDefault();
+}
+
+function handleTouchMove(e){
+    if(draggingPointerId === null) return;
+    for(const touch of e.changedTouches){
+        if(touch.identifier === draggingPointerId){
+            e.preventDefault();
+            moveDragging(touch.clientX, touch.clientY, touch.identifier);
             return;
         }
     }
 }
 
-function handleMove(e){
-
-    if(dragging<0) return;
-
-    corners[dragging].x=e.clientX;
-    corners[dragging].y=e.clientY;
+function handleTouchEnd(e){
+    for(const touch of e.changedTouches){
+        if(touch.identifier === draggingPointerId){
+            stopDragging(touch.identifier);
+            return;
+        }
+    }
 }
 
-function handleUp(){
-    dragging=-1;
-}
-
-canvas.addEventListener('mousedown',handleDown);
-window.addEventListener('mousemove',handleMove);
-window.addEventListener('mouseup',handleUp);
+canvas.addEventListener('pointerdown',handlePointerDown);
+canvas.addEventListener('pointermove',handlePointerMove);
+window.addEventListener('pointerup',e => stopDragging(e.pointerId));
+window.addEventListener('pointercancel',e => stopDragging(e.pointerId));
+canvas.addEventListener('touchstart',handleTouchStart,{passive:false});
+window.addEventListener('touchmove',handleTouchMove,{passive:false});
+window.addEventListener('touchend',handleTouchEnd);
+window.addEventListener('touchcancel',handleTouchEnd);
 
 
 //--------------------------------------------------
